@@ -14,6 +14,7 @@
 #include <memory>
 #include <string>
 
+#include "boost/asio/io_context.hpp"
 #include "odil/odil.h"
 
 namespace odil {
@@ -81,6 +82,8 @@ struct ODIL_API Transport {
 
  private:
   boost::asio::io_service _service;
+  std::shared_ptr<boost::asio::io_context::work> _service_work_guard;
+  std::thread _io_service_thread;
   std::shared_ptr<Socket> _socket;
   duration_type _timeout;
   boost::asio::deadline_timer _deadline;

@@ -10,9 +10,13 @@
 
 #include <boost/asio.hpp>
 #include <boost/date_time.hpp>
+#include <chrono>
+#include <functional>
+#include <future>
 #include <memory>
 #include <string>
 
+#include "boost/asio/error.hpp"
 #include "odil/Exception.h"
 #include "odil/logging.h"
 
@@ -20,11 +24,57 @@ namespace odil {
 
 namespace dul {
 
+struct HandlerPromise {
+  HandlerPromise() : p(), f(this->p.get_future()) {}
+
+  ~HandlerPromise() {
+    set_value(boost::asio::error::make_error_code(
+        boost::asio::error::basic_errors::operation_aborted));
+  }
+
+  void set_value(const boost::system::error_code& ec) {
+    using namespace std::literals;
+    // This trick allows to check if future has already been set or not, there
+    // is no standard API for this.
+    if (f.valid() && f.wait_for(std::chrono::milliseconds(0)) ==
+                         std::future_status::timeout) {
+      p.set_value(ec);
+    }
+  }
+
+  std::promise<boost::system::error_code> p;
+  std::future<boost::system::error_code> f;
+};
+
+void waitHandlerResult(const std::shared_ptr<HandlerPromise>& handler_promise,
+                       Transport::duration_type timeout) {
+  std::future_status wait_result = std::future_status::ready;
+  if (timeout.is_pos_infinity() || timeout.is_neg_infinity()) {
+    handler_promise->f.wait();
+  } else {
+    auto wait_duration =
+        std::chrono::microseconds(timeout.total_microseconds());
+    wait_result = handler_promise->f.wait_for(wait_duration);
+  }
+
+  if (wait_result != std::future_status::ready) {
+    throw Exception("TCP time out");
+  }
+
+  auto error = handler_promise->f.get();
+  if (error) {
+    throw Exception("Operation error: " + error.message());
+  }
+}
+
 Transport ::Transport()
     : _service(),
       _socket(nullptr),
       _timeout(boost::posix_time::pos_infin),
       _deadline(_service) {
+  _service_work_guard =
+      std::make_unique<boost::asio::io_context::work>(_service);
+  _io_service_thread = std::thread([this]() { _service.run(); });
   // Nothing else
 }
 
@@ -32,6 +82,9 @@ Transport ::~Transport() {
   if (this->is_open()) {
     this->close();
   }
+  _service_work_guard = nullptr;
+  _service.stop();
+  _io_service_thread.join();
 }
 
 boost::asio::io_service const& Transport ::get_service() const {
@@ -65,18 +118,16 @@ void Transport ::connect(Socket::endpoint_type const& peer_endpoint) {
     throw Exception("Already connected");
   }
 
-  auto source = Source::NONE;
-  boost::system::error_code error;
-  this->_start_deadline(source, error);
-
   this->_socket = std::make_shared<Socket>(this->_service);
+
+  auto handler_promise = std::make_shared<HandlerPromise>();
+
   this->_socket->async_connect(
-      peer_endpoint, [&source, &error](boost::system::error_code const& e) {
-        source = Source::OPERATION;
-        error = e;
+      peer_endpoint, [handler_promise](boost::system::error_code const& e) {
+        handler_promise->set_value(e);
       });
 
-  this->_run(source, error);
+  waitHandlerResult(handler_promise, this->get_timeout());
 }
 
 void Transport ::receive(Socket::endpoint_type const& endpoint) {
@@ -84,22 +135,20 @@ void Transport ::receive(Socket::endpoint_type const& endpoint) {
     throw Exception("Already connected");
   }
 
-  auto source = Source::NONE;
-  boost::system::error_code error;
-  this->_start_deadline(source, error);
-
   this->_socket = std::make_shared<Socket>(this->_service);
   this->_acceptor = std::make_shared<boost::asio::ip::tcp::acceptor>(
       this->_service, endpoint);
   boost::asio::socket_base::reuse_address option(true);
   this->_acceptor->set_option(option);
+
+  auto handler_promise = std::make_shared<HandlerPromise>();
+
   this->_acceptor->async_accept(
-      *this->_socket, [&source, &error](boost::system::error_code const& e) {
-        source = Source::OPERATION;
-        error = e;
+      *this->_socket, [handler_promise](boost::system::error_code const& e) {
+        handler_promise->set_value(e);
       });
 
-  this->_run(source, error);
+  waitHandlerResult(handler_promise, this->get_timeout());
 
   this->_acceptor = nullptr;
 }
@@ -132,18 +181,14 @@ std::string Transport ::read(std::size_t length) {
 
   std::string data(length, 'a');
 
-  auto source = Source::NONE;
-  boost::system::error_code error;
-  this->_start_deadline(source, error);
-
+  auto handler_promise = std::make_shared<HandlerPromise>();
   boost::asio::async_read(
       *this->_socket, boost::asio::buffer(&data[0], data.size()),
-      [&source, &error](boost::system::error_code const& e, std::size_t) {
-        source = Source::OPERATION;
-        error = e;
+      [handler_promise](boost::system::error_code const& e, std::size_t) {
+        handler_promise->set_value(e);
       });
 
-  this->_run(source, error);
+  waitHandlerResult(handler_promise, this->get_timeout());
 
   return data;
 }
@@ -153,76 +198,73 @@ void Transport ::write(std::string const& data) {
     throw Exception("Not connected");
   }
 
-  auto source = Source::NONE;
-  boost::system::error_code error;
-  this->_start_deadline(source, error);
+  auto handler_promise = std::make_shared<HandlerPromise>();
 
   boost::asio::async_write(
       *this->_socket, boost::asio::buffer(data),
-      [&source, &error](boost::system::error_code const& e, std::size_t) {
-        source = Source::OPERATION;
-        error = e;
+      [handler_promise](boost::system::error_code const& e, std::size_t) {
+        handler_promise->set_value(e);
       });
 
-  this->_run(source, error);
+  waitHandlerResult(handler_promise, this->get_timeout());
 }
 
-void Transport ::_start_deadline(Source& source,
-                                 boost::system::error_code& error) {
-  auto const canceled = this->_deadline.expires_from_now(this->_timeout);
-  if (canceled != 0) {
-    throw Exception("TCP timer started with pending operations");
-  }
+// void Transport ::_start_deadline(Source& source,
+//                                  boost::system::error_code& error) {
+//   auto const canceled = this->_deadline.expires_from_now(this->_timeout);
+//   if (canceled != 0) {
+//     throw Exception("TCP timer started with pending operations");
+//   }
 
-  this->_deadline.async_wait(
-      [&source, &error](boost::system::error_code const& e) {
-        source = Source::TIMER;
-        error = e;
-      });
-}
+//   this->_deadline.async_wait(
+//       [&source, &error](boost::system::error_code const& e) {
+//         source = Source::TIMER;
+//         error = e;
+//       });
+// }
 
-void Transport ::_stop_deadline() {
-  this->_deadline.expires_at(boost::posix_time::pos_infin);
-}
+// void Transport ::_stop_deadline() {
+//   this->_deadline.expires_at(boost::posix_time::pos_infin);
+// }
 
-void Transport ::_run(Source& source, boost::system::error_code& error) {
-  // WARNING: it seems that run_one runs a *simple* operation, not a
-  // *composed* operation, as is done by async_read/async_write
-  while (source == Source::NONE) {
-    auto const ran = this->_service.run_one();
-    if (ran == 0) {
-      throw Exception("No operations ran");
-    }
-    this->_service.reset();
-  }
+// void Transport ::_run(Source& source, boost::system::error_code& error) {
+//   // WARNING: it seems that run_one runs a *simple* operation, not a
+//   // *composed* operation, as is done by async_read/async_write
+//   while (source == Source::NONE) {
+//     auto const ran = this->_service.run_one();
+//     if (ran == 0) {
+//       throw Exception("No operations ran");
+//     }
+//     this->_service.reset();
+//   }
 
-  if (source == Source::OPERATION) {
-    if (error) {
-      throw Exception("Operation error: " + error.message());
-    }
+//   if (source == Source::OPERATION) {
+//     if (error) {
+//       throw Exception("Operation error: " + error.message());
+//     }
 
-    source = Source::NONE;
-    this->_stop_deadline();
+//     source = Source::NONE;
+//     this->_stop_deadline();
 
-    while (source == Source::NONE) {
-      auto const polled = this->_service.poll_one();
-      if (polled == 0) {
-        throw Exception("No operations polled");
-      }
-      this->_service.reset();
-    }
+//     while (source == Source::NONE) {
+//       auto const polled = this->_service.poll_one();
+//       if (polled == 0) {
+//         throw Exception("No operations polled");
+//       }
+//       this->_service.reset();
+//     }
 
-    if (source != Source::TIMER) {
-      throw Exception("Unknown event");
-    } else if (error != boost::asio::error::operation_aborted) {
-      throw Exception("TCP timer error: " + error.message());
-    }
-  } else if (source == Source::TIMER) {
-    throw Exception("TCP time out");
-  } else {
-    throw Exception("Unknown source");
-  }
-}
+//     if (source != Source::TIMER) {
+//       throw Exception("Unknown event");
+//     } else if (error != boost::asio::error::operation_aborted) {
+//       throw Exception("TCP timer error: " + error.message());
+//     }
+//   } else if (source == Source::TIMER) {
+//     throw Exception("TCP time out");
+//   } else {
+//     throw Exception("Unknown source");
+//   }
+// }
 
 }  // namespace dul
 
