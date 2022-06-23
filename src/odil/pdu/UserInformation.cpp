@@ -153,6 +153,7 @@ UserInformation
 
     this->set_sub_items(maximum_length);
     this->set_sub_items(implementation_class_uid);
+    this->set_sub_items(asynchronous_operation_window);
     this->set_sub_items(role_selection);
     this->set_sub_items(implementation_version_name);
     this->set_sub_items(user_identity_rq);
