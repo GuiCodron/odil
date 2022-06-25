@@ -15,6 +15,7 @@
 #include <string>
 
 #include "boost/asio/io_context.hpp"
+#include "odil/Exception.h"
 #include "odil/odil.h"
 
 namespace odil {
@@ -100,6 +101,15 @@ struct ODIL_API Transport {
   void _stop_deadline();
 
   void _run(Source& source, boost::system::error_code& error);
+};
+
+/**
+ * @brief Exception reported when transport connection has been closed.
+ */
+class ODIL_API TransportClosed : public Exception {
+ public:
+  TransportClosed();
+  virtual ~TransportClosed() = default;
 };
 
 }  // namespace dul

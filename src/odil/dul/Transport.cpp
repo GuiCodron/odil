@@ -8,6 +8,7 @@
 
 #include "odil/dul/Transport.h"
 
+#include <algorithm>
 #include <boost/asio.hpp>
 #include <boost/date_time.hpp>
 #include <chrono>
@@ -17,6 +18,8 @@
 #include <string>
 
 #include "boost/asio/error.hpp"
+#include "boost/exception/exception.hpp"
+#include "boost/system/detail/error_code.hpp"
 #include "odil/Exception.h"
 #include "odil/logging.h"
 
@@ -46,8 +49,28 @@ struct HandlerPromise {
   std::future<boost::system::error_code> f;
 };
 
+// TODO put it in a shared file
+template <class InputIt, class T>
+bool is_in_range(InputIt first, InputIt last, const T& value) {
+  return std::find(first, last, value) != last;
+}
+
+#define MAKE_ERROR(error_name) \
+  boost::asio::error::make_error_code(boost::asio::error::error_name)
+
+static boost::system::error_code CONNECTION_CLOSED_INDICATOR[]{
+    MAKE_ERROR(connection_aborted), MAKE_ERROR(broken_pipe),
+    MAKE_ERROR(connection_refused), MAKE_ERROR(connection_reset),
+    MAKE_ERROR(host_unreachable),   MAKE_ERROR(network_down),
+    MAKE_ERROR(network_reset),      MAKE_ERROR(network_unreachable),
+    MAKE_ERROR(not_connected),      MAKE_ERROR(not_socket),
+    MAKE_ERROR(shut_down),          MAKE_ERROR(eof),
+};
+#undef MAKE_ERROR
+
 void waitHandlerResult(const std::shared_ptr<HandlerPromise>& handler_promise,
-                       Transport::duration_type timeout) {
+                       Transport::duration_type timeout,
+                       boost::system::error_code& ec) {
   std::future_status wait_result = std::future_status::ready;
   if (timeout.is_pos_infinity() || timeout.is_neg_infinity()) {
     handler_promise->f.wait();
@@ -61,9 +84,15 @@ void waitHandlerResult(const std::shared_ptr<HandlerPromise>& handler_promise,
     throw Exception("TCP time out");
   }
 
-  auto error = handler_promise->f.get();
-  if (error) {
-    throw Exception("Operation error: " + error.message());
+  ec = handler_promise->f.get();
+}
+
+void waitHandlerResult(const std::shared_ptr<HandlerPromise>& handler_promise,
+                       Transport::duration_type timeout) {
+  boost::system::error_code ec;
+  waitHandlerResult(handler_promise, timeout, ec);
+  if (ec) {
+    throw Exception("Operation error: " + ec.message());
   }
 }
 
@@ -188,7 +217,19 @@ std::string Transport ::read(std::size_t length) {
         handler_promise->set_value(e);
       });
 
-  waitHandlerResult(handler_promise, this->get_timeout());
+  boost::system::error_code ec;
+  waitHandlerResult(handler_promise, this->get_timeout(), ec);
+  if (ec) {
+    if (is_in_range(
+            CONNECTION_CLOSED_INDICATOR,
+            CONNECTION_CLOSED_INDICATOR + sizeof(CONNECTION_CLOSED_INDICATOR),
+            ec)) {
+      this->close();
+      throw TransportClosed();
+    } else {
+      throw Exception("Operation error: " + ec.message());
+    }
+  }
 
   return data;
 }
@@ -265,6 +306,8 @@ void Transport ::write(std::string const& data) {
 //     throw Exception("Unknown source");
 //   }
 // }
+
+TransportClosed ::TransportClosed() : Exception("Transport Closed") {}
 
 }  // namespace dul
 

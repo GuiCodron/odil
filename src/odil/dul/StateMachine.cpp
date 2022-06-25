@@ -173,12 +173,24 @@ void StateMachine ::send_pdu(EventData &data) {
 }
 
 void StateMachine ::receive_pdu(EventData &data) {
-  auto const header = this->_transport.read(6);
+  std::string header;
+  try {
+    header = this->_transport.read(6);
+  } catch (TransportClosed const &) {
+    this->transition(Event::TransportConnectionClosedIndication, data);
+    throw TransportClosed();
+  }
 
   uint8_t const type = header[0];
   uint32_t const length =
       big_endian_to_host(*reinterpret_cast<uint32_t const *>(&header[0] + 2));
-  auto const pdu_data = this->_transport.read(length);
+  std::string pdu_data;
+  try {
+    pdu_data = this->_transport.read(length);
+  } catch (TransportClosed const &) {
+    this->transition(Event::TransportConnectionClosedIndication, data);
+    throw TransportClosed();
+  }
 
   std::stringstream stream;
   stream.write(&header[0], header.size());
