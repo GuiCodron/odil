@@ -20,6 +20,7 @@
 #include "boost/asio/error.hpp"
 #include "boost/exception/exception.hpp"
 #include "boost/system/detail/error_code.hpp"
+#include "boost/system/system_error.hpp"
 #include "odil/Exception.h"
 #include "odil/logging.h"
 
@@ -91,9 +92,7 @@ void waitHandlerResult(const std::shared_ptr<HandlerPromise>& handler_promise,
                        Transport::duration_type timeout) {
   boost::system::error_code ec;
   waitHandlerResult(handler_promise, timeout, ec);
-  if (ec) {
-    throw Exception("Operation error: " + ec.message());
-  }
+  if (ec) throw boost::system::system_error(ec);
 }
 
 Transport ::Transport()
@@ -227,7 +226,7 @@ std::string Transport ::read(std::size_t length) {
       this->close();
       throw TransportClosed();
     } else {
-      throw Exception("Operation error: " + ec.message());
+      throw boost::system::system_error(ec);
     }
   }
 
