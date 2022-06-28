@@ -126,7 +126,9 @@ std::shared_ptr<Transport::Socket const> Transport ::get_socket() const {
 }
 
 std::shared_ptr<Transport::Socket> Transport ::get_socket() {
-  return this->_socket;
+  std::lock_guard<std::mutex> l(_socket_mutex);
+  std::shared_ptr<Transport::Socket> socket = this->_socket;
+  return socket;
 }
 
 Transport::duration_type Transport ::get_timeout() const {
@@ -138,7 +140,8 @@ void Transport ::set_timeout(duration_type timeout) {
 }
 
 bool Transport ::is_open() const {
-  return (this->_socket != nullptr && this->_socket->is_open());
+  auto socket = this->get_socket();
+  return (socket != nullptr && socket->is_open());
 }
 
 void Transport ::connect(Socket::endpoint_type const& peer_endpoint) {
@@ -146,16 +149,17 @@ void Transport ::connect(Socket::endpoint_type const& peer_endpoint) {
     throw Exception("Already connected");
   }
 
-  this->_socket = std::make_shared<Socket>(this->_service);
+  auto socket = std::make_shared<Socket>(this->_service);
 
   auto handler_promise = std::make_shared<HandlerPromise>();
 
-  this->_socket->async_connect(
-      peer_endpoint, [handler_promise](boost::system::error_code const& e) {
-        handler_promise->set_value(e);
-      });
+  socket->async_connect(peer_endpoint,
+                        [handler_promise](boost::system::error_code const& e) {
+                          handler_promise->set_value(e);
+                        });
 
   waitHandlerResult(handler_promise, this->get_timeout());
+  this->_set_socket(socket);
 }
 
 void Transport ::receive(Socket::endpoint_type const& endpoint) {
@@ -163,7 +167,7 @@ void Transport ::receive(Socket::endpoint_type const& endpoint) {
     throw Exception("Already connected");
   }
 
-  this->_socket = std::make_shared<Socket>(this->_service);
+  auto socket = std::make_shared<Socket>(this->_service);
   this->_acceptor = std::make_shared<boost::asio::ip::tcp::acceptor>(
       this->_service, endpoint);
   boost::asio::socket_base::reuse_address option(true);
@@ -172,11 +176,13 @@ void Transport ::receive(Socket::endpoint_type const& endpoint) {
   auto handler_promise = std::make_shared<HandlerPromise>();
 
   this->_acceptor->async_accept(
-      *this->_socket, [handler_promise](boost::system::error_code const& e) {
+      *socket, [handler_promise](boost::system::error_code const& e) {
         handler_promise->set_value(e);
       });
 
   waitHandlerResult(handler_promise, this->get_timeout());
+
+  this->_set_socket(socket);
 
   this->_acceptor = nullptr;
 }
@@ -187,8 +193,9 @@ void Transport ::close() {
     this->_acceptor = nullptr;
   }
   if (this->is_open()) {
+    auto socket = this->get_socket();
     try {
-      this->_socket->shutdown(boost::asio::ip::tcp::socket::shutdown_both);
+      socket->shutdown(boost::asio::ip::tcp::socket::shutdown_both);
     }
     // Only used to prevent uncatchable error on WIN32 platforms and in
     // wrappers.
@@ -197,21 +204,21 @@ void Transport ::close() {
     } catch (...) {
       ODIL_LOG(debug) << "Could not shut down transport (unknown exception)";
     }
-    this->_socket->close();
-    this->_socket = nullptr;
+    socket->close();
+    this->_set_socket(nullptr);
   }
 }
 
 std::string Transport ::read(std::size_t length) {
+  auto socket = this->get_socket();
   if (!this->is_open()) {
     throw Exception("Not connected");
   }
 
   std::string data(length, 'a');
-
   auto handler_promise = std::make_shared<HandlerPromise>();
   boost::asio::async_read(
-      *this->_socket, boost::asio::buffer(&data[0], data.size()),
+      *socket, boost::asio::buffer(&data[0], data.size()),
       [handler_promise](boost::system::error_code const& e, std::size_t) {
         handler_promise->set_value(e);
       });
@@ -234,6 +241,7 @@ std::string Transport ::read(std::size_t length) {
 }
 
 void Transport ::write(std::string const& data) {
+  auto socket = this->get_socket();
   if (!this->is_open()) {
     throw Exception("Not connected");
   }
@@ -241,12 +249,17 @@ void Transport ::write(std::string const& data) {
   auto handler_promise = std::make_shared<HandlerPromise>();
 
   boost::asio::async_write(
-      *this->_socket, boost::asio::buffer(data),
+      *socket, boost::asio::buffer(data),
       [handler_promise](boost::system::error_code const& e, std::size_t) {
         handler_promise->set_value(e);
       });
 
   waitHandlerResult(handler_promise, this->get_timeout());
+}
+
+void Transport ::_set_socket(std::shared_ptr<Socket> socket) {
+  std::lock_guard<std::mutex> l(this->_socket_mutex);
+  this->_socket = socket;
 }
 
 // void Transport ::_start_deadline(Source& source,

@@ -12,6 +12,7 @@
 #include <boost/asio.hpp>
 #include <boost/date_time.hpp>
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include "boost/asio/io_context.hpp"
@@ -86,6 +87,7 @@ struct ODIL_API Transport {
   std::shared_ptr<boost::asio::io_context::work> _service_work_guard;
   std::thread _io_service_thread;
   std::shared_ptr<Socket> _socket;
+  std::mutex _socket_mutex;
   duration_type _timeout;
   boost::asio::deadline_timer _deadline;
 
@@ -99,6 +101,7 @@ struct ODIL_API Transport {
 
   void _start_deadline(Source& source, boost::system::error_code& error);
   void _stop_deadline();
+  void _set_socket(std::shared_ptr<Socket> socket);
 
   void _run(Source& source, boost::system::error_code& error);
 };
